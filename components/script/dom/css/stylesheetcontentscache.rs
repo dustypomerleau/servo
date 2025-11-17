@@ -11,12 +11,8 @@ use std::rc::Rc;
 use servo_arc::Arc as ServoArc;
 use style::context::QuirksMode;
 use style::shared_lock::SharedRwLock;
-use style::stylesheets::{AllowImportRules, CssRule, Origin, StylesheetContents, UrlExtraData};
+use style::stylesheets::{CssRule, StylesheetContents};
 use stylo_atoms::Atom;
-
-use crate::dom::node::NodeTraits;
-use crate::dom::types::HTMLElement;
-use crate::stylesheet_loader::ElementStylesheetLoader;
 
 const MAX_LENGTH_OF_TEXT_INSERTED_INTO_TABLE: usize = 1024;
 const UNIQUE_OWNED: usize = 2;
@@ -38,7 +34,7 @@ pub(crate) struct StylesheetContentsCacheKey {
 }
 
 impl StylesheetContentsCacheKey {
-    fn new(stylesheet_text: &str, base_url: &str, quirks_mode: QuirksMode) -> Self {
+    pub(crate) fn new(stylesheet_text: &str, base_url: &str, quirks_mode: QuirksMode) -> Self {
         // The stylesheet text may be quite lengthy, exceeding hundreds of kilobytes.
         // Instead of directly inserting such a huge string into AtomicString table,
         // take its hash value and use that. (This is not a cryptographic hash, so a
@@ -81,20 +77,15 @@ impl StylesheetContentsCache {
     }
 
     pub(crate) fn get_or_insert_with(
-        stylesheet_text: &str,
+        cache_key: StylesheetContentsCacheKey,
         shared_lock: &SharedRwLock,
-        url_data: UrlExtraData,
-        quirks_mode: QuirksMode,
-        element: &HTMLElement,
+        callback: impl FnOnce(&SharedRwLock) -> ServoArc<StylesheetContents>,
     ) -> (
         Option<StylesheetContentsCacheKey>,
         ServoArc<StylesheetContents>,
     ) {
-        let cache_key =
-            StylesheetContentsCacheKey::new(stylesheet_text, url_data.as_str(), quirks_mode);
         STYLESHEETCONTENTS_CACHE.with_borrow_mut(|stylesheetcontents_cache| {
-            let entry = stylesheetcontents_cache.entry(cache_key);
-            match entry {
+            match stylesheetcontents_cache.entry(cache_key) {
                 Entry::Occupied(occupied_entry) => {
                     // Use a copy of the cache key from `Entry` instead of the newly created one above
                     // to correctly update and track to owner count of `StylesheetContents`.
@@ -104,22 +95,7 @@ impl StylesheetContentsCache {
                     )
                 },
                 Entry::Vacant(vacant_entry) => {
-                    let contents = {
-                        #[cfg(feature = "tracing")]
-                        let _span = tracing::trace_span!("ParseStylesheet", servo_profiling = true)
-                            .entered();
-                        StylesheetContents::from_str(
-                            stylesheet_text,
-                            url_data,
-                            Origin::Author,
-                            shared_lock,
-                            Some(&ElementStylesheetLoader::new(element)),
-                            Some(element.owner_window().css_error_reporter()),
-                            quirks_mode,
-                            AllowImportRules::Yes,
-                            /* sanitized_output = */ None,
-                        )
-                    };
+                    let contents = callback(shared_lock);
                     if Self::contents_can_be_cached(&contents, shared_lock) {
                         let occupied_entry = vacant_entry.insert_entry(contents.clone());
                         // Use a copy of the cache key from `Entry` instead of the newly created one above

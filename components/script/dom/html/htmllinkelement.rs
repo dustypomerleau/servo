@@ -59,16 +59,9 @@ use crate::dom::virtualmethods::VirtualMethods;
 use crate::links::LinkRelations;
 use crate::network_listener::{FetchResponseListener, ResourceTimingListener, submit_timing};
 use crate::script_runtime::CanGc;
-use crate::stylesheet_loader::{ElementStylesheetLoader, StylesheetContextSource, StylesheetOwner};
-
-#[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
-pub(crate) struct RequestGenerationId(u32);
-
-impl RequestGenerationId {
-    fn increment(self) -> RequestGenerationId {
-        RequestGenerationId(self.0 + 1)
-    }
-}
+use crate::stylesheet_loader::{
+    ElementStylesheetLoader, RequestGenerationId, StylesheetContextSource, StylesheetOwner,
+};
 
 #[dom_struct]
 pub(crate) struct HTMLLinkElement {
@@ -97,7 +90,7 @@ pub(crate) struct HTMLLinkElement {
     /// Whether any of the loads have failed.
     any_failed_load: Cell<bool>,
     /// A monotonically increasing counter that keeps track of which stylesheet to apply.
-    request_generation_id: Cell<RequestGenerationId>,
+    generation_id: Cell<RequestGenerationId>,
     /// <https://html.spec.whatwg.org/multipage/#explicitly-enabled>
     is_explicitly_enabled: Cell<bool>,
     /// Whether the previous type matched with the destination
@@ -124,7 +117,7 @@ impl HTMLLinkElement {
             cssom_stylesheet: MutNullableDom::new(None),
             pending_loads: Cell::new(0),
             any_failed_load: Cell::new(false),
-            request_generation_id: Cell::new(RequestGenerationId(0)),
+            generation_id: Default::default(),
             is_explicitly_enabled: Cell::new(false),
             previous_type_matched: Cell::new(true),
             previous_media_environment_matched: Cell::new(true),
@@ -151,8 +144,13 @@ impl HTMLLinkElement {
         )
     }
 
-    pub(crate) fn get_request_generation_id(&self) -> RequestGenerationId {
-        self.request_generation_id.get()
+    fn note_that_href_or_type_changed(&self) {
+        // Cancel any previous loads as they no longer apply to this `<link>` tag.
+        self.generation_id.set(self.generation_id.get().increment());
+        // Stop waiting any pending loads to finish before sending "load" or "error" events.
+        self.pending_loads.set(0);
+        // Any previous failed loads no longer matter.
+        self.any_failed_load.set(true);
     }
 
     // FIXME(emilio): These methods are duplicated with
@@ -246,6 +244,8 @@ impl VirtualMethods for HTMLLinkElement {
                     .set(LinkRelations::for_element(self.upcast()));
             },
             local_name!("href") => {
+                self.note_that_href_or_type_changed();
+
                 if is_removal {
                     return;
                 }
@@ -303,6 +303,8 @@ impl VirtualMethods for HTMLLinkElement {
                 }
             },
             local_name!("type") => {
+                self.note_that_href_or_type_changed();
+
                 // https://html.spec.whatwg.org/multipage/#link-type-stylesheet
                 // When the type attribute of the link element of an external resource link that
                 // is already browsing-context connected is set or changed to a value that does
@@ -591,9 +593,6 @@ impl HTMLLinkElement {
             None => "",
         };
 
-        self.request_generation_id
-            .set(self.request_generation_id.get().increment());
-
         let loader = ElementStylesheetLoader::new(self.upcast());
         loader.load(
             StylesheetContextSource::LinkElement,
@@ -626,10 +625,6 @@ impl HTMLLinkElement {
         let Ok(href) = self.Href().parse() else {
             return;
         };
-
-        // Ignore all previous fetch operations
-        self.request_generation_id
-            .set(self.request_generation_id.get().increment());
 
         let cache_result = window.image_cache().get_cached_image_status(
             href,
@@ -680,7 +675,7 @@ impl HTMLLinkElement {
     fn register_image_cache_callback(&self, id: PendingImageId) -> ImageCacheResponseCallback {
         let trusted_node = Trusted::new(self);
         let window = self.owner_window();
-        let request_generation_id = self.get_request_generation_id();
+        let request_generation_id = self.request_generation_id();
         window.register_image_cache_listener(id, move |response| {
             let trusted_node = trusted_node.clone();
             let link_element = trusted_node.root();
@@ -691,7 +686,7 @@ impl HTMLLinkElement {
                 return;
             };
 
-            if request_generation_id != link_element.get_request_generation_id() {
+            if request_generation_id != link_element.request_generation_id() {
                 // This load is no longer relevant.
                 return;
             };
@@ -703,7 +698,7 @@ impl HTMLLinkElement {
                 .queue(task!(process_favicon_response: move || {
                     let element = trusted_node.root();
 
-                    if request_generation_id != element.get_request_generation_id() {
+                    if request_generation_id != element.request_generation_id() {
                         // This load is no longer relevant.
                         return;
                     };
@@ -819,6 +814,10 @@ impl HTMLLinkElement {
 }
 
 impl StylesheetOwner for HTMLLinkElement {
+    fn request_generation_id(&self) -> RequestGenerationId {
+        self.generation_id.get()
+    }
+
     fn increment_pending_loads_count(&self) {
         self.pending_loads.set(self.pending_loads.get() + 1)
     }

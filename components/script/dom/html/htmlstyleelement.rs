@@ -12,7 +12,9 @@ use net_traits::ReferrerPolicy;
 use script_bindings::root::Dom;
 use servo_arc::Arc;
 use style::media_queries::MediaList as StyleMediaList;
-use style::stylesheets::{Stylesheet, StylesheetInDocument, UrlExtraData};
+use style::stylesheets::{
+    AllowImportRules, Origin, Stylesheet, StylesheetContents, StylesheetInDocument, UrlExtraData,
+};
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
@@ -35,7 +37,7 @@ use crate::dom::medialist::MediaList;
 use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits, UnbindContext};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
-use crate::stylesheet_loader::StylesheetOwner;
+use crate::stylesheet_loader::{ElementStylesheetLoader, RequestGenerationId, StylesheetOwner};
 
 #[dom_struct]
 pub(crate) struct HTMLStyleElement {
@@ -50,6 +52,8 @@ pub(crate) struct HTMLStyleElement {
     parser_inserted: Cell<bool>,
     in_stack_of_open_elements: Cell<bool>,
     pending_loads: Cell<u32>,
+    /// A monotonically increasing counter that keeps track of which stylesheet to apply.
+    generation_id: Cell<RequestGenerationId>,
     any_failed_load: Cell<bool>,
 }
 
@@ -68,6 +72,7 @@ impl HTMLStyleElement {
             parser_inserted: Cell::new(creator.is_parser_created()),
             in_stack_of_open_elements: Cell::new(creator.is_parser_created()),
             pending_loads: Cell::new(0),
+            generation_id: Default::default(),
             any_failed_load: Cell::new(false),
         }
     }
@@ -139,13 +144,33 @@ impl HTMLStyleElement {
         // to avoid reedundant parsing of the style sheets. Additionally, the cache hit rate of
         // stylo's `CascadeDataCache` can now be significantly improved. When shared `StylesheetContents`
         // is modified, copy-on-write will occur, see `CSSStyleSheet::will_modify`.
-        let (cache_key, contents) = StylesheetContentsCache::get_or_insert_with(
-            &data.str(),
-            &shared_lock,
-            UrlExtraData(doc.base_url().get_arc()),
-            doc.quirks_mode(),
-            self.upcast(),
-        );
+
+        let url_data = UrlExtraData(doc.base_url().get_arc());
+        let cache_key =
+            StylesheetContentsCacheKey::new(&data.str(), url_data.as_str(), doc.quirks_mode());
+        let (cache_key, contents) =
+            StylesheetContentsCache::get_or_insert_with(cache_key, &shared_lock, |shared_lock| {
+                #[cfg(feature = "tracing")]
+                let _span =
+                    tracing::trace_span!("ParseStylesheet", servo_profiling = true).entered();
+
+                // Reset the state for any potential `@import` statement loads.
+                self.generation_id.set(self.generation_id.get().increment());
+                self.any_failed_load.set(false);
+                self.pending_loads.set(0);
+
+                StylesheetContents::from_str(
+                    &data.str(),
+                    url_data,
+                    Origin::Author,
+                    shared_lock,
+                    Some(&ElementStylesheetLoader::new(self.upcast())),
+                    Some(self.owner_window().css_error_reporter()),
+                    doc.quirks_mode(),
+                    AllowImportRules::Yes,
+                    /* sanitized_output = */ None,
+                )
+            });
 
         let sheet = Arc::new(Stylesheet {
             contents: shared_lock.wrap(contents),
@@ -367,6 +392,10 @@ impl VirtualMethods for HTMLStyleElement {
 }
 
 impl StylesheetOwner for HTMLStyleElement {
+    fn request_generation_id(&self) -> RequestGenerationId {
+        self.generation_id.get()
+    }
+
     fn increment_pending_loads_count(&self) {
         self.pending_loads.set(self.pending_loads.get() + 1)
     }

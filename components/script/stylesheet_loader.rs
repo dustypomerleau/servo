@@ -37,7 +37,7 @@ use crate::dom::element::Element;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::html::htmlelement::HTMLElement;
-use crate::dom::html::htmllinkelement::{HTMLLinkElement, RequestGenerationId};
+use crate::dom::html::htmllinkelement::HTMLLinkElement;
 use crate::dom::node::NodeTraits;
 use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::shadowroot::ShadowRoot;
@@ -51,7 +51,22 @@ use crate::unminify::{
     BeautifyFileType, create_output_file, create_temp_files, execute_js_beautify,
 };
 
+#[derive(Clone, Copy, Default, JSTraceable, MallocSizeOf, PartialEq)]
+pub(crate) struct RequestGenerationId(u32);
+
+impl RequestGenerationId {
+    pub(crate) fn increment(self) -> RequestGenerationId {
+        RequestGenerationId(self.0 + 1)
+    }
+}
+
 pub(crate) trait StylesheetOwner {
+    /// A [`StylesheetGenerationId`] which describes the "generation" of a stylesheet, identifying
+    /// the parsing and loading jobs (for a stylsheet and all of its `@import` stylesheets). Since
+    /// loading and parsing happen asynchronously, this is used to ignore completed jobs after the
+    /// element that originated the loading and parsing has changed.
+    fn request_generation_id(&self) -> RequestGenerationId;
+
     /// Returns whether this element was inserted by the parser (i.e., it should
     /// trigger a document-load-blocking load).
     fn parser_inserted(&self) -> bool;
@@ -91,9 +106,10 @@ struct StylesheetContext {
     document: Trusted<Document>,
     shadow_root: Option<Trusted<ShadowRoot>>,
     origin_clean: bool,
-    /// A token which must match the generation id of the `HTMLLinkElement` for it to load the stylesheet.
-    /// This is ignored for `HTMLStyleElement` and imports.
-    request_generation_id: Option<RequestGenerationId>,
+    /// A token which must match the generation id of the `HTMLLinkElement` or `HTMLStyleElement`
+    /// for it to load the stylesheet. When the original element changes any loads or successful
+    /// parsing for previous generations is ignored.
+    request_generation_id: RequestGenerationId,
 }
 
 impl StylesheetContext {
@@ -154,23 +170,19 @@ impl StylesheetContext {
         ))
     }
 
-    fn contributes_to_the_styling_processing_model(&self, element: &HTMLElement) -> bool {
+    fn contributes_to_the_styling_processing_model(
+        &self,
+        owner: &dyn StylesheetOwner,
+        element: &HTMLElement,
+    ) -> bool {
+        // Elements that are no longer connected to the page DOM do not affect the style processing model.
         if !element.upcast::<Element>().is_connected() {
             return false;
         }
 
-        // Whether or not this `StylesheetContext` is for a `<link>` element that comes
-        // from a previous generation. This prevents processing of earlier stylsheet URLs
-        // when the URL has changed.
-        //
-        // TODO(mrobinson): Shouldn't we also exit early if this is an import that was originally
-        // imported from a `<link>` element that has advanced a generation as well?
-        if !matches!(&self.source, StylesheetContextSource::LinkElement) {
-            return true;
-        }
-        let link = element.downcast::<HTMLLinkElement>().unwrap();
-        self.request_generation_id
-            .is_none_or(|generation| generation == link.get_request_generation_id())
+        // Check whether the original element has changed such that it no longer needs to load this
+        // stylesheet,
+        self.request_generation_id == owner.request_generation_id()
     }
 
     fn decrement_load_and_render_blockers(&self, owner: &dyn StylesheetOwner, document: &Document) {
@@ -188,41 +200,6 @@ impl StylesheetContext {
         }
     }
 
-    fn finish_load(
-        self,
-        successful: bool,
-        owner: &dyn StylesheetOwner,
-        element: &HTMLElement,
-        document: &Document,
-    ) {
-        self.decrement_load_and_render_blockers(owner, document);
-        document.finish_load(LoadType::Stylesheet(self.url), CanGc::note());
-
-        let Some(any_failed) = owner.load_finished(successful) else {
-            return;
-        };
-
-        // Do not fire any events on disconnected nodes.
-        if !element.upcast::<Element>().is_connected() {
-            return;
-        }
-
-        // We need to fire an event even if this load is for an ignored stylsheet (such as
-        // one from a previous generation). Events are delayed until all loads are complete,
-        // so we may need to fire the load event for the real load that happened earlier.
-        //
-        // TODO(mrobinson): This is a pretty confusing way of doing things and could potentially
-        // delay the "load" event. Loads from previous generations should likely not count for
-        // delaying the event.
-        let event = match any_failed {
-            true => atom!("error"),
-            false => atom!("load"),
-        };
-        element
-            .upcast::<EventTarget>()
-            .fire_event(event, CanGc::note());
-    }
-
     fn do_post_parse_tasks(self, successful: bool, stylesheet: Option<Arc<Stylesheet>>) {
         let element = self.element.root();
         let document = self.document.root();
@@ -231,16 +208,18 @@ impl StylesheetContext {
             .as_stylesheet_owner()
             .expect("Stylesheet not loaded by <style> or <link> element!");
 
+        // Note that loads have completed. This is done regardless of whether or not this
+        // stylesheet still applies as they are tracked Document-wide.
+        self.decrement_load_and_render_blockers(owner, &document);
+        document.finish_load(LoadType::Stylesheet(self.url.clone()), CanGc::note());
+
         // From <https://html.spec.whatwg.org/multipage/#link-type-stylesheet>:
         // > If `el` no longer creates an external resource link that contributes to the
         // > styling processing model, or if, since the resource in question was fetched, it
         // > has become appropriate to fetch it again, then:
         // >   1. Remove el from el's node document's script-blocking style sheet set.
         // >   2. Return.
-        if !self.contributes_to_the_styling_processing_model(&element) {
-            // Always consider ignored loads as successful, as they shouldn't cause any subsequent
-            // successful loads to fire an "error" event.
-            self.finish_load(true, owner, &element, &document);
+        if !self.contributes_to_the_styling_processing_model(owner, &element) {
             return;
         }
 
@@ -271,7 +250,17 @@ impl StylesheetContext {
         }
         owner.set_origin_clean(self.origin_clean);
 
-        self.finish_load(successful, owner, &element, &document);
+        let Some(any_failed) = owner.load_finished(successful) else {
+            return;
+        };
+
+        let event = match any_failed {
+            true => atom!("error"),
+            false => atom!("load"),
+        };
+        element
+            .upcast::<EventTarget>()
+            .fire_event(event, CanGc::note());
     }
 }
 
@@ -350,7 +339,11 @@ impl FetchResponseListener for StylesheetContext {
         // > has become appropriate to fetch it again, then:
         // >   1. Remove el from el's node document's script-blocking style sheet set.
         // >   2. Return.
-        if !self.contributes_to_the_styling_processing_model(&element) {
+        let owner = element
+            .upcast::<Element>()
+            .as_stylesheet_owner()
+            .expect("Stylesheet not loaded by <style> or <link> element!");
+        if !self.contributes_to_the_styling_processing_model(owner, &element) {
             self.do_post_parse_tasks(successful, None);
             return;
         }
@@ -358,7 +351,7 @@ impl FetchResponseListener for StylesheetContext {
         let loader = if pref!(dom_parallel_css_parsing_enabled) {
             ElementStylesheetLoader::Asynchronous(AsynchronousStylesheetLoader::new(&element))
         } else {
-            ElementStylesheetLoader::Synchronous { element: &element }
+            ElementStylesheetLoader::new(&element)
         };
         loader.parse(successful, self, &element, &document);
     }
@@ -387,13 +380,23 @@ impl ResourceTimingListener for StylesheetContext {
 }
 
 pub(crate) enum ElementStylesheetLoader<'a> {
-    Synchronous { element: &'a HTMLElement },
+    Synchronous {
+        element: &'a HTMLElement,
+        request_generation_id: RequestGenerationId,
+    },
     Asynchronous(AsynchronousStylesheetLoader),
 }
 
 impl<'a> ElementStylesheetLoader<'a> {
     pub(crate) fn new(element: &'a HTMLElement) -> Self {
-        ElementStylesheetLoader::Synchronous { element }
+        let owner = element
+            .upcast::<Element>()
+            .as_stylesheet_owner()
+            .expect("Stylesheet not loaded by <style> or <link> element!");
+        ElementStylesheetLoader::Synchronous {
+            element,
+            request_generation_id: owner.request_generation_id(),
+        }
     }
 }
 
@@ -407,13 +410,17 @@ impl ElementStylesheetLoader<'_> {
         integrity_metadata: String,
     ) {
         match self {
-            ElementStylesheetLoader::Synchronous { element } => Self::load_with_element(
+            ElementStylesheetLoader::Synchronous {
+                element,
+                request_generation_id,
+            } => Self::load_with_element(
                 element,
                 source,
                 media,
                 url,
                 cors_setting,
                 integrity_metadata,
+                *request_generation_id,
             ),
             ElementStylesheetLoader::Asynchronous { .. } => unreachable!(
                 "Should never call load directly on an asynchronous ElementStylesheetLoader"
@@ -428,14 +435,12 @@ impl ElementStylesheetLoader<'_> {
         url: ServoUrl,
         cors_setting: Option<CorsSettings>,
         integrity_metadata: String,
+        request_generation_id: RequestGenerationId,
     ) {
         let document = element.owner_document();
         let shadow_root = element
             .containing_shadow_root()
             .map(|sr| Trusted::new(&*sr));
-        let generation = element
-            .downcast::<HTMLLinkElement>()
-            .map(HTMLLinkElement::get_request_generation_id);
         let context = StylesheetContext {
             element: Trusted::new(element),
             source,
@@ -446,7 +451,7 @@ impl ElementStylesheetLoader<'_> {
             document: Trusted::new(&*document),
             shadow_root,
             origin_clean: true,
-            request_generation_id: generation,
+            request_generation_id,
         };
 
         let owner = element
@@ -588,30 +593,37 @@ impl StyleStylesheetLoader for ElementStylesheetLoader<'_> {
         };
 
         match self {
-            ElementStylesheetLoader::Synchronous { element } => {
+            ElementStylesheetLoader::Synchronous {
+                element,
+                request_generation_id,
+            } => {
                 Self::load_with_element(
                     element,
                     source,
                     media,
                     resolved_url.into(),
-                    None,
-                    "".to_owned(),
+                    None,          /* cors_setting */
+                    "".to_owned(), /* integrity metadata */
+                    *request_generation_id,
                 );
             },
             ElementStylesheetLoader::Asynchronous(AsynchronousStylesheetLoader {
                 element,
                 main_thread_sender,
                 pipeline_id,
+                request_generation_id,
             }) => {
                 let element = element.clone();
+                let request_generation_id = *request_generation_id;
                 let task = task!(load_import_stylesheet_on_main_thread: move || {
                     Self::load_with_element(
                         &element.root(),
                         source,
                         media,
                         resolved_url.into(),
-                        None,
-                        "".to_owned()
+                        None, /* cors_setting */
+                        "".to_owned(), /* integrity metadata */
+                        request_generation_id
                     );
                 });
                 let _ =
@@ -632,15 +644,21 @@ pub(crate) struct AsynchronousStylesheetLoader {
     element: Trusted<HTMLElement>,
     main_thread_sender: Sender<MainThreadScriptMsg>,
     pipeline_id: PipelineId,
+    request_generation_id: RequestGenerationId,
 }
 
 impl AsynchronousStylesheetLoader {
     pub(crate) fn new(element: &HTMLElement) -> Self {
         let window = element.owner_window();
+        let owner = element
+            .upcast::<Element>()
+            .as_stylesheet_owner()
+            .expect("Stylesheet not loaded by <style> or <link> element!");
         Self {
             element: Trusted::new(element),
             main_thread_sender: window.main_thread_script_chan().clone(),
             pipeline_id: window.pipeline_id(),
+            request_generation_id: owner.request_generation_id(),
         }
     }
 }
